@@ -1,0 +1,76 @@
+---
+title: "eMudhra CA Incident Mitigation"
+sidebarTitle: "eMudhra CA Incident"
+description: "What the October 2026 certificate-authority incident means for FastMCP deployments, and how to remediate every trust store your runtime uses"
+icon: shield-halved
+---
+
+This page is the mitigation reference for humans and agents responding to the October 2026 eMudhra/emSign certificate-authority incident. It explains what FastMCP's releases address and what still needs to happen in the environment running your clients and servers. Guidance was checked on **October 20, 2026**; follow the linked upstream sources for subsequent updates.
+
+## What to do
+
+Upgrade within your supported FastMCP major line to [4.1.3](https://github.com/PrefectHQ/fastmcp/releases/tag/v4.1.3) or [3.4.11](https://github.com/PrefectHQ/fastmcp/releases/tag/v3.4.11), update the other trust stores your deployment uses, rebuild and restart affected processes, and verify from the deployed runtime. **A FastMCP package upgrade alone does not remediate every trust store.**
+
+These are responses to an upstream CA incident, not evidence that FastMCP's own signing keys or repository were compromised. The [incident response page](https://emudhra.we-have-a-problem.com/) documents the compromised intermediates, direct and cross-signed chains, affected clients, and current platform guidance. An attacker able to intercept traffic may impersonate HTTPS destinations to clients that still trust those chains.
+
+## What the FastMCP patches change
+
+| Installation or request path                    | Trust source                                     | What to update                                                                                                                                                                              |
+| ----------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FastMCP 3 default HTTP stack                    | HTTPX's certifi bundle                           | 3.4.11 requires certifi >=2026.10.19 through the MCP/client/server dependency paths. Update existing environments and locks.                                                                |
+| FastMCP 4 default HTTP stack                    | HTTPX2's operating-system trust                  | Update the actual OS trust used by the runtime. Upgrading certifi alone does not repair this path.                                                                                           |
+| Certifi-backed server dependencies and optional SDK integrations | May use certifi independently of the default HTTP client | Both patches constrain the relevant extras to certifi >=2026.10.19. This includes supported older jsonschema-path versions on 4.x that use Requests.                         |
+| Custom TLS configuration or client factory      | Whatever CA bundle/context the application selects | Review and update that store separately, including environment overrides.                                                                                                                  |
+| Package installers and build tools              | Their own bundled and/or system trust             | Update each tool and affected environment separately.                                                                                                                                        |
+
+FastMCP 2.x is outside the supported release lines; operators still need to remediate its environment and plan an upgrade to a supported major.
+
+The implementation is in [#5945](https://github.com/PrefectHQ/fastmcp/pull/5945) and [#5946](https://github.com/PrefectHQ/fastmcp/pull/5946). The changes set dependency requirements, not just a development-lock update. They preserve existing TLS configuration hooks. Conflicting old certifi pins must be updated; do not bypass the dependency checks or disable certificate verification.
+
+This concerns **both client and server deployments**. Clients make HTTPS connections to remote MCP servers and OAuth services. Servers also act as HTTPS clients when fetching OAuth/JWKS metadata, proxying upstream MCP servers, or calling APIs through integrations. Check those outbound paths even if your incoming endpoint has a valid certificate. Updating an incoming server certificate does not update its outbound trust. If your own certificate chain is affected, follow your certificate provider's replacement guidance too.
+
+## Update the environment as well as the package
+
+1. **Repair installer trust first.** The [Python security team's guidance](https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576) specifies certifi >=2026.10.19, pip >=26.2.2, and uv >=0.13.4 where used. It also supplies a checksum-pinned pip bootstrap command for updating through an older installer. Upgrade uv using its installation method. Check other tools you use against that guidance, including sigstore.
+2. **Update the application's dependency declaration, lock, and installed environment.** Keep your existing major line. For pip-managed environments, after repairing pip, use one of the commands below. For uv projects, update the matching FastMCP requirement and refresh the relevant locked dependencies, then sync. If a dependency-age policy blocks the security release, add a targeted exception. Check uv tool/uvx, pipx, embedded applications, and CI environments separately; they may not use your shell's virtual environment.
+3. **Update OS and container trust.** A host update does not update a container image's CA bundle. Confirm that your distribution's update actually contains the distrust change, then rebuild and redeploy images. Merely installing the latest available CA package is not sufficient while a distribution's fix is pending. Follow the incident page for platform-specific remedies, including all affected direct and AAA cross-signed paths.
+4. **Inspect custom stores.** Check `SSL_CERT_FILE`, `SSL_CERT_DIR`, Requests-specific bundles, explicit `verify` contexts, and custom client factories. Corporate TLS interception can add another independently managed upstream trust boundary. Preserve necessary private CAs while applying the relevant distrust; do not append a corrected bundle to an old one and assume the compromised trust was removed.
+5. **Restart and verify.** Running SSL contexts can retain old trust. Restart processes and repeat the checks below from the service's actual environment. Repeat for existing environments and newly created ones: older Python installations can seed an old pip through `ensurepip`.
+
+After repairing pip, choose the command matching your current major:
+
+```bash
+python -m pip install --upgrade 'fastmcp>=3.4.11,<4' 'certifi>=2026.10.19'
+```
+
+```bash
+python -m pip install --upgrade 'fastmcp>=4.1.3,<5' 'certifi>=2026.10.19'
+```
+
+If you deliberately install `fastmcp-slim` with selected extras or `fastmcp-remote`, update those installed distributions within the same major instead, preserving your extras. Do not introduce the full distribution solely to update a slim installation.
+
+**Pip has a separate trap:** updating the application's certifi or the OS alone does not replace pip's vendored certifi. With pip's default truststore backend, `--cert` and `REQUESTS_CA_BUNDLE` add trust; they do not subtract its bundled roots. Update pip itself in each environment where it is used. Certifi **2026.10.19** is preferred over .18 because it restores unaffected roots that .18 removed unnecessarily. See the [certifi advisory](https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2) and [uv advisory](https://github.com/astral-sh/uv/security/advisories/GHSA-hq85-5cpj-mr62).
+
+## Verify the actual deployed runtime
+
+Check versions and dependency consistency using that environment's interpreter; check the uv binary actually used by the deployment as applicable:
+
+```bash
+python -m pip show fastmcp fastmcp-slim certifi
+python -m pip check
+uv --version
+```
+
+A missing optional distribution in `pip show` is not by itself a failure. Version numbers are evidence of installed dependencies, not proof that custom or system trust was repaired.
+
+Use the [incident page's test endpoints and offline chains](https://emudhra.we-have-a-problem.com/#check) from each relevant HTTP stack and configuration. Test **all 12 supplied TLS chains**, including the direct and AAA cross-signed paths. Require a certificate-validation rejection; a timeout, DNS failure, firewall block, or generic connection error is inconclusive. Also confirm that ordinary HTTPS connections to your actual upstreams still work.
+
+A browser's success at rejecting a test chain does not establish that Python, curl, an installer, or a container rejects it. FastMCP 4's [HTTPX2 default](https://pydantic.dev/docs/httpx2/advanced/ssl/) and FastMCP 3's [HTTPX default](https://www.python-httpx.org/advanced/ssl/) differ. Test explicit client factories and custom contexts through the application's own path. Do not send production tokens or credentials to the public test endpoints.
+
+## Release verification
+
+After publication, fresh **PyPI** installations of 3.4.11 and 4.1.3 on macOS with Python 3.12 passed dependency-consistency checks and an actual HTTP MCP client/server round trip (`list_tools` and `add(2, 3) == 5`). Each installation rejected all 12 incident TLS test endpoints through FastMCP's outbound fetch path, while ordinary PyPI and gofastmcp HTTPS requests returned 200. The 3.x test used the corrected certifi bundle; the 4.x test exercised this machine's native system trust. An initial DNS failure on one 4.x probe was treated as inconclusive; the repeated complete probe passed.
+
+All seven package distributions across the two release lines were verified on their versioned PyPI endpoints. The [4.1.3 changelog](/changelog) and updated [transport guidance](/clients/transports#ssl-verification) are deployed. The maintenance release did not replace the 4.x docs or GitHub Latest release.
+
+These checks establish behavior for the tested configurations, not every customer's OS, custom bundle, network proxy, or deployment. The [FastMCP security notice](https://github.com/PrefectHQ/fastmcp/blob/main/SECURITY.md#certificate-authority-incident-october-2026) and this page should be read together with current upstream incident guidance. Report suspected FastMCP-specific vulnerabilities privately using that security policy; use the [tracking issue](https://github.com/PrefectHQ/fastmcp/issues/5952) for public mitigation corrections and verified operational findings, without posting secrets.

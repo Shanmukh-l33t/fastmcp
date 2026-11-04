@@ -20,6 +20,8 @@ Update **uv to 0.13.4 or later** and **pip to 26.2.2 or later** where used. Upda
 
 Verify from the actual deployed runtime that the [incident test chains](https://emudhra.we-have-a-problem.com/#check) fail certificate verification and your normal upstream connections still work. A timeout is not evidence of distrust. Do not disable certificate verification to restore connectivity.
 
+A fuller mitigation reference for operators and agents, including per-path update steps and release verification, is published on [gofastmcp.com](https://gofastmcp.com/more/emudhra-ca-incident) and tracked in [issue #5952](https://github.com/PrefectHQ/fastmcp/issues/5952).
+
 ## Reporting a Vulnerability
 
 Please report security vulnerabilities privately using [GitHub's security advisory feature](https://github.com/PrefectHQ/fastmcp/security/advisories/new). Do not open public issues for security concerns.
