@@ -20,6 +20,31 @@ UNSAFE_REDIRECT_URI_SCHEMES = frozenset(
 )
 
 
+def _normalize_redirect_uri(uri: str) -> str:
+    """Normalize a redirect URI string the way ``AnyUrl`` normalizes it.
+
+    ``AnyUrl`` applies WHATWG URL normalization when it is constructed
+    (backslashes become slashes, dot segments and trailing control
+    characters are resolved away, IPv4 shorthand and percent-encoded
+    hosts are decoded, IDNA hosts are mapped), but a plain ``str`` was
+    previously parsed by bare ``urlparse``, so the same URI could be
+    accepted as a string and rejected as an ``AnyUrl`` (or vice versa).
+    Passing string inputs through the same normalization makes both
+    forms agree.
+
+    Inputs that are not valid URLs -- including wildcard-port patterns
+    such as ``http://localhost:*``, which only ever reach this module as
+    patterns -- are returned unchanged so existing matching behavior is
+    preserved for them.
+    """
+    try:
+        return str(AnyUrl(uri))
+    except (ValueError, TypeError):
+        # ValidationError (a ValueError subclass) for URLs that cannot be
+        # parsed at all, plus TypeError so a non-string never raises here.
+        return uri
+
+
 def add_query_params(url: str, params: dict[str, str]) -> str:
     """Append query parameters to a URL while preserving existing parameters.
 
@@ -342,7 +367,35 @@ def matches_allowed_pattern(uri: str, pattern: str) -> bool:
     # a 302 Location resolves the dot-segments and lands at `/steal`, outside
     # the intended allowlist prefix. Reject at validation time so the stored
     # redirect_uri cannot later be emitted verbatim in a redirect.
+    #
+    # These checks run on the raw input: normalization below would resolve
+    # dot-segments (and percent-encoded variants of them) away, erasing the
+    # evidence they reject.
     if _has_dot_segments(uri_parsed.path):
+        return False
+
+    # Normalize both sides the way `AnyUrl` parses URLs (WHATWG rules), so a
+    # raw string is judged exactly like the same value passed as `AnyUrl`:
+    # backslashes become path separators, dot-segments and trailing control
+    # characters are resolved away, IPv4 shorthand and percent-encoded hosts
+    # are decoded, and IDNA hosts are mapped. The raw security checks above
+    # must run first, because normalization erases their evidence.
+    uri = _normalize_redirect_uri(uri)
+    pattern = _normalize_redirect_uri(pattern)
+    try:
+        uri_parsed = urlparse(uri)
+        pattern_parsed = urlparse(pattern)
+    except ValueError:
+        return False
+
+    # Re-run the security checks on the normalized form as well: this is the
+    # exact string an `AnyUrl` input would arrive as, so both input forms are
+    # judged by identical checks here. Normalization can only surface these
+    # (e.g. a scheme hidden behind whitespace), never hide them.
+    if uri_parsed.scheme.lower() in UNSAFE_REDIRECT_URI_SCHEMES:
+        return False
+
+    if uri_parsed.username is not None or uri_parsed.password is not None:
         return False
 
     # Scheme must match exactly
@@ -403,8 +456,13 @@ def is_redirect_uri_allowed_for_application_type(
     registered-client record carries when the field was never set — is treated
     the same way.
     """
-    uri_str = str(redirect_uri)
+    uri_str = _normalize_redirect_uri(str(redirect_uri))
 
+    # Normalization runs first so the unsafe-scheme check and the component
+    # comparisons below see exactly what an `AnyUrl` input would arrive as.
+    # A scheme is never altered by normalization (only case/whitespace), so
+    # this check catches everything the raw form would, plus anything the
+    # normalization surfaces.
     if _is_unsafe_redirect_uri(uri_str):
         return False
 

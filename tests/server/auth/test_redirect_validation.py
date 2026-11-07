@@ -12,6 +12,7 @@ from fastmcp.server.auth.redirect_validation import (
     DEFAULT_LOCALHOST_PATTERNS,
     add_query_params,
     build_client_redirect,
+    is_redirect_uri_allowed_for_application_type,
     matches_allowed_pattern,
     replace_query_param,
     validate_redirect_uri,
@@ -583,3 +584,66 @@ class TestDefaultPatterns:
         assert not validate_redirect_uri(
             "https://claude.ai/api/mcp/auth_callback", DEFAULT_LOCALHOST_PATTERNS
         )
+
+
+class TestRawStringNormalizationParity:
+    """A plain ``str`` URI must be judged exactly like its ``AnyUrl`` form.
+
+    ``AnyUrl`` normalizes a URI when it is constructed (WHATWG rules:
+    backslashes become slashes, dot segments and trailing control
+    characters are resolved away, IPv4 shorthand and percent-encoded
+    hosts are decoded, IDNA hosts are mapped). The str-form helpers used
+    to hand the raw string straight to ``urlparse``, so the two forms of
+    the same URI could be judged differently -- see issue #6295.
+    """
+
+    @pytest.mark.parametrize(
+        "uri, pattern",
+        [
+            ("https://evil.com\\.example.com/cb", "https://*.example.com/*"),
+            ("https://app.example.com/cb/..\\steal", "https://app.example.com/cb/*"),
+            ("https://app.example.com/cb/.. ", "https://app.example.com/cb/*"),
+        ],
+    )
+    def test_validate_redirect_uri_string_matches_anyurl_form(
+        self, uri: str, pattern: str
+    ) -> None:
+        assert validate_redirect_uri(AnyUrl(uri), [pattern]) is False
+        assert validate_redirect_uri(uri, [pattern]) is False
+        assert matches_allowed_pattern(uri, pattern) is False
+
+    @pytest.mark.parametrize(
+        "uri, application_type",
+        [
+            ("http://evil.com\\.localhost/cb", "native"),
+            ("https://127.1/cb", "web"),
+            ("https://loc%61lhost/cb", "web"),
+            ("https://a。localhost/cb", "web"),
+            ("https://localhost\x00", "web"),
+        ],
+    )
+    def test_application_type_string_matches_anyurl_form(
+        self, uri: str, application_type: str
+    ) -> None:
+        expected = is_redirect_uri_allowed_for_application_type(
+            AnyUrl(uri), application_type
+        )
+        assert expected is False
+        assert is_redirect_uri_allowed_for_application_type(uri, application_type) == (
+            expected
+        )
+
+    @pytest.mark.parametrize(
+        "uri, pattern",
+        [
+            ("http://localhost:3000/cb", "http://localhost:*"),
+            ("https://app.example.com/cb", "https://app.example.com/cb"),
+            ("https://api.trusted.io/auth", "https://*.trusted.io/*"),
+            ("https://münchen.example/cb", "https://münchen.example/*"),
+        ],
+    )
+    def test_legitimate_strings_still_match_in_both_forms(
+        self, uri: str, pattern: str
+    ) -> None:
+        assert matches_allowed_pattern(uri, pattern) is True
+        assert matches_allowed_pattern(str(AnyUrl(uri)), pattern) is True
