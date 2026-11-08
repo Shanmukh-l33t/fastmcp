@@ -882,57 +882,19 @@ def _combine_schemas(route: HTTPRoute) -> dict[str, Any]:
     return schema
 
 
-def extract_output_schema_from_responses(
-    responses: dict[str, ResponseInfo],
-    schema_definitions: dict[str, Any] | None = None,
-    openapi_version: str | None = None,
-) -> dict[str, Any] | None:
+def _output_schema_for_response(
+    response_info: ResponseInfo,
+    schema_definitions: dict[str, Any] | None,
+    definitions: dict[str, Any],
+    openapi_version: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Build the output schema declared by a single success response.
+
+    Returns the schema together with its own ``$defs`` (captured before any
+    wrapping moves them a level down), or None when the response declares no
+    schema for the tool to validate against.
     """
-    Extract output schema from OpenAPI responses for use as MCP tool output schema.
-
-    This function finds the first successful response (200, 201, 202, 204) with a
-    JSON-compatible content type and extracts its schema. If the schema is not an
-    object type, it wraps it to comply with MCP requirements. When any successful
-    response has no content, there is no output schema, since the operation may
-    answer without a body.
-
-    Args:
-        responses: Dictionary of ResponseInfo objects keyed by status code
-        schema_definitions: Optional schema definitions to include in the output schema
-        openapi_version: OpenAPI version string, used to optimize nullable field handling
-
-    Returns:
-        dict: MCP-compliant output schema with potential wrapping, or None if no suitable schema found
-    """
-    if not responses:
-        return None
-
-    # MCP requires structured content from a tool that advertises an output
-    # schema, which a bodiless success response (e.g. 204) cannot provide.
-    if any(
-        status_code.startswith("2") and not resp_info.content_schema
-        for status_code, resp_info in responses.items()
-    ):
-        return None
-
-    # Priority order for success status codes
-    success_codes = ["200", "201", "202", "204"]
-
-    # Find the first successful response
-    response_info = None
-    for status_code in success_codes:
-        if status_code in responses:
-            response_info = responses[status_code]
-            break
-
-    # If no explicit success codes, try any 2xx response
-    if response_info is None:
-        for status_code, resp_info in responses.items():
-            if status_code.startswith("2"):
-                response_info = resp_info
-                break
-
-    if response_info is None or not response_info.content_schema:
+    if not response_info.content_schema:
         return None
 
     # Prefer application/json, then fall back to other JSON-compatible types
@@ -974,14 +936,6 @@ def extract_output_schema_from_responses(
                 # Replace $ref with the actual schema definition
                 output_schema = _replace_ref_with_defs(schema_definitions[schema_name])
 
-    # Unconverted definitions, so $ref targets still carry their access annotations
-    definitions = {
-        name: _replace_ref_with_defs(def_schema)
-        if isinstance(def_schema, dict)
-        else def_schema
-        for name, def_schema in (schema_definitions or {}).items()
-    }
-
     if openapi_version and openapi_version.startswith("3"):
         # Convert OpenAPI 3.x schema to JSON Schema format for proper handling
         # of constructs like oneOf, anyOf, and nullable fields. writeOnly
@@ -1014,6 +968,87 @@ def extract_output_schema_from_responses(
             "x-fastmcp-wrap-result": True,
         }
         output_schema = wrapped_schema
+
+    return output_schema, inline_defs
+
+
+def extract_output_schema_from_responses(
+    responses: dict[str, ResponseInfo],
+    schema_definitions: dict[str, Any] | None = None,
+    openapi_version: str | None = None,
+) -> dict[str, Any] | None:
+    """
+    Extract output schema from OpenAPI responses for use as MCP tool output schema.
+
+    Every success response (200, 201, 202, 204, ...) contributes its schema, so a
+    body matching any declared success response validates. Responses declaring the
+    same schema are combined once; differing ones are combined with ``anyOf``. If
+    the schema is not an object type, it wraps it to comply with MCP requirements.
+    When any successful response has no content, there is no output schema, since
+    the operation may answer without a body.
+
+    Args:
+        responses: Dictionary of ResponseInfo objects keyed by status code
+        schema_definitions: Optional schema definitions to include in the output schema
+        openapi_version: OpenAPI version string, used to optimize nullable field handling
+
+    Returns:
+        dict: MCP-compliant output schema with potential wrapping, or None if no suitable schema found
+    """
+    if not responses:
+        return None
+
+    # MCP requires structured content from a tool that advertises an output
+    # schema, which a bodiless success response (e.g. 204) cannot provide.
+    if any(
+        status_code.startswith("2") and not resp_info.content_schema
+        for status_code, resp_info in responses.items()
+    ):
+        return None
+
+    # Unconverted definitions, so $ref targets still carry their access annotations
+    definitions = {
+        name: _replace_ref_with_defs(def_schema)
+        if isinstance(def_schema, dict)
+        else def_schema
+        for name, def_schema in (schema_definitions or {}).items()
+    }
+
+    # Priority order for success status codes
+    success_codes = ["200", "201", "202", "204"]
+    ordered_codes = [
+        status_code for status_code in success_codes if status_code in responses
+    ]
+    ordered_codes += [
+        status_code
+        for status_code in responses
+        if status_code.startswith("2") and status_code not in ordered_codes
+    ]
+
+    schemas: list[dict[str, Any]] = []
+    inline_defs: dict[str, Any] = {}
+    for status_code in ordered_codes:
+        extracted = _output_schema_for_response(
+            responses[status_code], schema_definitions, definitions, openapi_version
+        )
+        if extracted is None:
+            continue
+        schema, schema_defs = extracted
+        # The same schema may be declared by several responses; advertise it once.
+        if any(schema == seen for seen in schemas):
+            continue
+        schemas.append(schema)
+        inline_defs.update(schema_defs)
+
+    if not schemas:
+        return None
+
+    if len(schemas) == 1:
+        output_schema = schemas[0]
+    else:
+        # Any declared success response may come back, so the schema the tool
+        # advertises has to accept each of them.
+        output_schema = {"type": "object", "anyOf": schemas}
 
     # Reattach the definitions at the root even when there are no component
     # schemas: the non-object wrap moves the schema's own $defs one level down,

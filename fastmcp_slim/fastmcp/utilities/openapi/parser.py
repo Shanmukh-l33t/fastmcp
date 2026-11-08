@@ -453,15 +453,76 @@ class OpenAPIParser(
         # If no success codes found, return None (tool will have no output schema)
         return None
 
-    def _extract_bodiless_success_responses(
+    def _response_info(self, response: Any, status_code: str) -> ResponseInfo:
+        """Build a ResponseInfo for one response, extracting its media schemas.
+
+        Raises on an unresolvable external reference so the caller can decide
+        whether that response is fatal.
+        """
+        # Create response info
+        resp_info = ResponseInfo(description=response.description)
+
+        # Extract content schemas
+        if hasattr(response, "content") and response.content:
+            for media_type_str, media_type_obj in response.content.items():
+                if (
+                    media_type_obj
+                    and hasattr(media_type_obj, "media_type_schema")
+                    and media_type_obj.media_type_schema
+                ):
+                    try:
+                        # Track if this is a top-level $ref before resolution
+                        top_level_schema_name = None
+                        media_schema = media_type_obj.media_type_schema
+                        if isinstance(media_schema, self.reference_cls):
+                            ref_str = media_schema.ref
+                            if isinstance(ref_str, str) and ref_str.startswith(
+                                "#/components/schemas/"
+                            ):
+                                pointer = ref_str.removeprefix("#/components/schemas/")
+                                # Only a whole component is a top-level
+                                # schema; a pointer into one is not.
+                                if "/" not in pointer:
+                                    top_level_schema_name = pointer
+
+                        schema_dict = self._extract_schema_as_dict(media_schema)
+                        # Add marker for top-level schema if it was a ref
+                        if top_level_schema_name:
+                            schema_dict["x-fastmcp-top-level-schema"] = (
+                                top_level_schema_name
+                            )
+                        resp_info.content_schema[media_type_str] = schema_dict
+                    except ValueError as e:
+                        # Re-raise ValueError for external reference errors
+                        if "External or non-local reference not supported" in str(e):
+                            raise
+                        logger.error(
+                            f"Failed to extract schema for media type '{media_type_str}' "
+                            f"in response {status_code}: {e}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to extract schema for media type '{media_type_str}' "
+                            f"in response {status_code}: {e}"
+                        )
+                else:
+                    # Record the media type even without a schema so MIME
+                    # type inference can still use the declared content type.
+                    resp_info.content_schema.setdefault(media_type_str, {})
+
+        return resp_info
+
+    def _extract_other_success_responses(
         self, operation_responses: dict[str, Any], primary_status_code: str
     ) -> dict[str, ResponseInfo]:
-        """Extract the success responses, besides the primary one, that declare no body.
+        """Extract the success responses besides the primary one.
 
-        Such a response (e.g. a 204 next to a 201) means the operation may answer
-        without a body, so the tool cannot promise structured output.
+        An operation may declare more than one success body (200 with a report,
+        202 with a queued job), and each schema is needed to validate whichever
+        body the upstream actually returns. A response that declares no body
+        still means the operation may answer without one.
         """
-        bodiless_responses: dict[str, ResponseInfo] = {}
+        other_responses: dict[str, ResponseInfo] = {}
         for status_code, resp_or_ref in operation_responses.items():
             if status_code == primary_status_code or not str(status_code).startswith(
                 "2"
@@ -472,26 +533,38 @@ class OpenAPIParser(
             except ValueError as e:
                 logger.debug(f"Skipping unresolved response {status_code}: {e}")
                 continue
-            if isinstance(response, self.response_cls) and not response.content:
-                bodiless_responses[str(status_code)] = ResponseInfo(
-                    description=response.description
+            if not isinstance(response, self.response_cls):
+                continue
+            try:
+                other_responses[str(status_code)] = self._response_info(
+                    response, str(status_code)
                 )
-        return bodiless_responses
+            except ValueError as e:
+                # An unresolvable reference in a secondary response drops that
+                # response only; the primary one already reported its own.
+                logger.debug(f"Skipping response {status_code}: {e}")
+            except Exception as e:
+                logger.error(
+                    f"Failed to extract response for status code {status_code}: {e}",
+                    exc_info=False,
+                )
+        return other_responses
 
     def _extract_responses(
         self, operation_responses: dict[str, Any] | None
     ) -> dict[str, ResponseInfo]:
         """Extract and resolve response information.
 
-        Only includes the primary success response for MCP tools, plus any other
-        success response that has no body.
+        Includes the primary success response plus every other success response,
+        so schemas for each declared success body stay available.
         """
         extracted_responses: dict[str, ResponseInfo] = {}
 
         if not operation_responses:
             return extracted_responses
 
-        # For MCP tools, we only need the primary success response
+        # The primary response carries the strictest error handling; the rest
+        # of the success responses are collected alongside it.
         primary_response = self._get_primary_success_response(operation_responses)
         if not primary_response:
             logger.debug("No success responses found, tool will have no output schema")
@@ -510,62 +583,9 @@ class OpenAPIParser(
                 )
                 return extracted_responses
 
-            # Create response info
-            resp_info = ResponseInfo(description=response.description)
-
-            # Extract content schemas
-            if hasattr(response, "content") and response.content:
-                for media_type_str, media_type_obj in response.content.items():
-                    if (
-                        media_type_obj
-                        and hasattr(media_type_obj, "media_type_schema")
-                        and media_type_obj.media_type_schema
-                    ):
-                        try:
-                            # Track if this is a top-level $ref before resolution
-                            top_level_schema_name = None
-                            media_schema = media_type_obj.media_type_schema
-                            if isinstance(media_schema, self.reference_cls):
-                                ref_str = media_schema.ref
-                                if isinstance(ref_str, str) and ref_str.startswith(
-                                    "#/components/schemas/"
-                                ):
-                                    pointer = ref_str.removeprefix(
-                                        "#/components/schemas/"
-                                    )
-                                    # Only a whole component is a top-level
-                                    # schema; a pointer into one is not.
-                                    if "/" not in pointer:
-                                        top_level_schema_name = pointer
-
-                            schema_dict = self._extract_schema_as_dict(media_schema)
-                            # Add marker for top-level schema if it was a ref
-                            if top_level_schema_name:
-                                schema_dict["x-fastmcp-top-level-schema"] = (
-                                    top_level_schema_name
-                                )
-                            resp_info.content_schema[media_type_str] = schema_dict
-                        except ValueError as e:
-                            # Re-raise ValueError for external reference errors
-                            if "External or non-local reference not supported" in str(
-                                e
-                            ):
-                                raise
-                            logger.error(
-                                f"Failed to extract schema for media type '{media_type_str}' "
-                                f"in response {status_code}: {e}"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to extract schema for media type '{media_type_str}' "
-                                f"in response {status_code}: {e}"
-                            )
-                    else:
-                        # Record the media type even without a schema so MIME
-                        # type inference can still use the declared content type.
-                        resp_info.content_schema.setdefault(media_type_str, {})
-
-            extracted_responses[str(status_code)] = resp_info
+            extracted_responses[str(status_code)] = self._response_info(
+                response, str(status_code)
+            )
         except ValueError as e:
             # Re-raise ValueError for external reference errors
             if "External or non-local reference not supported" in str(e):
@@ -585,7 +605,7 @@ class OpenAPIParser(
             )
 
         extracted_responses.update(
-            self._extract_bodiless_success_responses(operation_responses, status_code)
+            self._extract_other_success_responses(operation_responses, status_code)
         )
         return extracted_responses
 
