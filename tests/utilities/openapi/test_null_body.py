@@ -77,6 +77,77 @@ def test_null_uses_selected_media_type() -> None:
     assert request.content == b""
 
 
+@pytest.mark.parametrize(
+    ("version", "body_schema"),
+    [
+        ("3.1.0", {"type": ["string", "null"]}),
+        ("3.0.3", {"type": "string", "nullable": True}),
+        ("3.1.0", {"anyOf": [{"type": "string"}, {"type": "null"}]}),
+        ("3.1.0", {"oneOf": [{"type": "string"}, {"type": "null"}]}),
+        ("3.1.0", {"$ref": "#/components/schemas/NullableString"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "media_type", ["application/json", "application/merge-patch+json"]
+)
+def test_explicit_whole_body_json_null(
+    version: str, body_schema: dict[str, Any], media_type: str
+) -> None:
+    spec = _whole_body_spec(version, body_schema, media_type)
+    route = parse_openapi_to_http_routes(spec)[0]
+    request = RequestDirector(SchemaPath.from_dict(spec)).build(route, {"body": None})
+    assert request.content == b"null"
+    assert request.headers["content-type"] == media_type
+
+
+def test_omitted_optional_whole_body_sends_no_body() -> None:
+    spec = _whole_body_spec("3.1.0", {"type": ["string", "null"]}, "application/json")
+    spec["paths"]["/value"]["post"]["requestBody"]["required"] = False
+    route = parse_openapi_to_http_routes(spec)[0]
+    request = RequestDirector(SchemaPath.from_dict(spec)).build(route, {})
+    assert request.content == b""
+    assert "content-type" not in request.headers
+
+
+def test_non_null_whole_body_still_serialized() -> None:
+    spec = _whole_body_spec("3.1.0", {"type": ["string", "null"]}, "application/json")
+    route = parse_openapi_to_http_routes(spec)[0]
+    request = RequestDirector(SchemaPath.from_dict(spec)).build(route, {"body": "hi"})
+    assert json.loads(request.content) == "hi"
+    assert request.headers["content-type"] == "application/json"
+
+
+def _whole_body_spec(
+    version: str, body_schema: dict[str, Any], media_type: str
+) -> dict[str, Any]:
+    """Spec whose entire request body is one (possibly nullable) JSON value."""
+    return {
+        "openapi": version,
+        "info": {"title": "Value", "version": "1.0"},
+        "components": {
+            "schemas": {
+                "NullableString": (
+                    {"type": "string", "nullable": True}
+                    if version.startswith("3.0")
+                    else {"type": ["string", "null"]}
+                )
+            }
+        },
+        "paths": {
+            "/value": {
+                "post": {
+                    "operationId": "set_value",
+                    "requestBody": {
+                        "required": True,
+                        "content": {media_type: {"schema": body_schema}},
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+    }
+
+
 def _spec(
     version: str, property_schema: dict[str, Any], media_type: str
 ) -> dict[str, Any]:

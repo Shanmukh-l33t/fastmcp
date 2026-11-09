@@ -23,6 +23,22 @@ _MAX_PATH_DECODINGS = 32
 _PATH_TEMPLATE_PARAM = re.compile(r"\{([^{}]+)\}")
 
 
+class _ExplicitNullBody:
+    """Marker for a whole-body argument the caller passed as JSON `null`.
+
+    `None` already means "no body", so an explicit null needs its own
+    sentinel to travel from argument un-flattening to request building.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<explicit null body>"
+
+
+_EXPLICIT_NULL_BODY = _ExplicitNullBody()
+
+
 def _query_scalar_to_str(value: Any) -> str:
     """Convert a scalar to its query-string representation.
 
@@ -200,7 +216,15 @@ class RequestDirector:
         # but all accept None, so we set exactly one and pass all to Request().
         files: list[tuple[str, Any]] | None = None
         data: dict[str, Any] | None = None
-        if body is not None:
+        if body is _EXPLICIT_NULL_BODY:
+            # An explicit JSON null is a four-byte body of its own, not an
+            # absent one. Only JSON media types accept null, so the declared
+            # content type (if any) already names a JSON type; httpx's
+            # content= never sets Content-Type, so set it here.
+            content = b"null"
+            headers = dict(headers) if headers else {}
+            headers["Content-Type"] = raw_content_type or "application/json"
+        elif body is not None:
             if declared_content_type == "multipart/form-data" and isinstance(
                 body, dict
             ):
@@ -384,8 +408,10 @@ class RequestDirector:
                     body = body_props
                 elif len(body_props) == 1:
                     # Free-form objects, arrays, and primitives use a single
-                    # argument containing the entire body.
-                    body = next(iter(body_props.values()))
+                    # argument containing the entire body. An explicit null
+                    # is the JSON document `null`, not an absent body.
+                    value = next(iter(body_props.values()))
+                    body = _EXPLICIT_NULL_BODY if value is None else value
                 else:
                     body = body_props
             else:
