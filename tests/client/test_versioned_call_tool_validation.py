@@ -122,6 +122,60 @@ async def test_pinned_call_to_the_listed_version_still_validates() -> None:
             await client.call_tool("liar", version="1.0")
 
 
+@pytest.mark.parametrize("spelling", ["1", "v1.0", "1.0.0"])
+async def test_pinned_call_with_equivalent_spelling_still_hydrates(
+    spelling: str,
+) -> None:
+    """A PEP 440-equivalent spelling of the listed version keeps hydration.
+
+    The server resolves a pin with `VersionSpec(eq=...)` matching, which is
+    PEP 440-normalized and `v`-prefix insensitive: "1", "1.0", "1.0.0" and
+    "v1.0" all select the tool listed as "1.0". The client must treat the
+    pinned call the same way, so the cached schema still describes the
+    version that ran. (#6439)
+    """
+    server = FastMCP("single")
+
+    @server.tool(name="when", version="1.0")
+    def when() -> datetime.datetime:
+        return datetime.datetime(2024, 1, 2, 3, 4, 5)
+
+    @server.tool(name="point", version="1.0")
+    def point() -> Point:
+        return Point(x=1, y=2)
+
+    async with Client(server) as client:
+        pinned_when = await client.call_tool("when", version=spelling)
+        pinned_point = await client.call_tool("point", version=spelling)
+
+    assert pinned_when.data == datetime.datetime(2024, 1, 2, 3, 4, 5)
+    assert pinned_point.data.x == 1
+    assert pinned_point.data.y == 2
+    assert not isinstance(pinned_point.data, dict)
+
+
+@pytest.mark.parametrize("spelling", ["1", "v1.0", "1.0.0"])
+async def test_pinned_call_with_equivalent_spelling_still_validates(
+    spelling: str,
+) -> None:
+    """A PEP 440-equivalent spelling of the listed version keeps revalidation.
+
+    Pinning "1" or "v1.0" runs the listed "1.0" tool, so a result that
+    violates its advertised output schema must still raise instead of
+    passing through unvalidated. (#6439)
+    """
+    server = FastMCP("liar")
+
+    @server.tool(name="liar", version="1.0")
+    def liar() -> int:
+        """Declares int, returns a string."""
+        return "oops"  # type: ignore[return-value]  # ty:ignore[invalid-return-type]
+
+    async with Client(server) as client:
+        with pytest.raises(RuntimeError, match="Invalid structured content"):
+            await client.call_tool("liar", version=spelling)
+
+
 async def test_unpinned_call_still_validates_a_non_conforming_result() -> None:
     """Pinning a version must not turn result validation off in general."""
     server = FastMCP("liar")

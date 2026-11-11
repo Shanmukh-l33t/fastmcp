@@ -19,6 +19,7 @@ from mcp.shared._httpx_utils import McpHttpClientFactory
 from typing_extensions import TypedDict, Unpack
 
 from fastmcp.client._version_pin import pinned_call
+from fastmcp.utilities.versions import parse_version_key
 
 # TypeVar for preserving specific ClientTransport subclass types
 ClientTransportT = TypeVar("ClientTransportT", bound="ClientTransport")
@@ -79,7 +80,10 @@ class VersionAwareClientSession(ClientSession):
     The session records the version each listed tool advertises in
     ``_meta.fastmcp.version``. A pinned call to that version validates as
     usual; a pinned call to any other version skips the check, since its schema
-    is not obtainable over the wire. Every unpinned call validates as before.
+    is not obtainable over the wire. Version equality mirrors the server's
+    ``VersionSpec(eq=...)`` pin matching -- PEP 440-normalized and ``v``-prefix
+    insensitive -- so a pin spelled ``"1"`` or ``"v1.0"`` is the listed
+    ``"1.0"`` and still validates. Every unpinned call validates as before.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -109,7 +113,12 @@ class VersionAwareClientSession(ClientSession):
         if pin is not None and pin.session is self:
             if name not in self._tool_output_schemas:
                 await self.list_tools()
-            if self._tool_listed_versions.get(name) != pin.version:
+            # Same normalized comparison as the server's pin resolution: a
+            # PEP 440-equivalent spelling (or v-prefix variant) of the listed
+            # version ran that listed tool, so its schema applies. (#6439)
+            if parse_version_key(self._tool_listed_versions.get(name)) != (
+                parse_version_key(pin.version)
+            ):
                 return
         await super().validate_tool_result(name, result)
 

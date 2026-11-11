@@ -21,6 +21,7 @@ from fastmcp.telemetry import inject_trace_context
 from fastmcp.utilities.json_schema_type import json_schema_to_type_adapter
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.timeout import normalize_timeout_to_seconds
+from fastmcp.utilities.versions import parse_version_key
 
 logger = get_logger(__name__)
 
@@ -417,6 +418,9 @@ async def _parse_call_tool_result(
             The cached schema describes that version only, so a result pinned
             to any other version (or when the listed version is unknown) is
             hydrated from ``structured_content`` as it arrived instead.
+            Version equality is PEP 440-normalized and v-prefix insensitive,
+            matching the server's pin resolution: a pin spelled "1" or "v1.0"
+            is the same version as a listed "1.0".
 
     Returns:
         CallToolResult: Parsed result with structured data
@@ -452,9 +456,14 @@ async def _parse_call_tool_result(
             # pinned to another version has no advertised schema, so coercing
             # through the cached one would reject content that is valid for
             # the version that ran; only the result meta's wrap flag applies.
+            # Version equality mirrors the server's VersionSpec(eq=...) pin
+            # matching: PEP 440-normalized and v-prefix insensitive, so a pin
+            # spelled "1" or "v1.0" still selects a tool listed as "1.0" and
+            # keeps hydration. (#6439)
             if pinned_version is None or (
                 listed_versions is not None
-                and listed_versions.get(name) == pinned_version
+                and parse_version_key(listed_versions.get(name))
+                == parse_version_key(pinned_version)
             ):
                 output_schema = tool_output_schemas.get(name)
             else:
