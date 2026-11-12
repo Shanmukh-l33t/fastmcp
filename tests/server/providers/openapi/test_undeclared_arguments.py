@@ -1,4 +1,5 @@
-"""OpenAPI components ignore undeclared arguments and keep configured headers."""
+"""OpenAPI component argument handling: undeclared arguments, strict input
+validation of advertised schemas, and configured headers."""
 
 import json
 from typing import Any
@@ -391,3 +392,151 @@ async def test_strict_validation_accepts_suffix_on_manual_route() -> None:
                 await client.call_tool("get_user", {"id": 1, "debug": True})
 
     assert [str(r.url) for r in requests] == [f"{BASE_URL}/users/123"]
+
+
+NESTED_OBJECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "options": {
+            "type": "object",
+            "properties": {"level": {"type": "integer"}},
+            "required": ["level"],
+            "additionalProperties": False,
+        }
+    },
+    "required": ["options"],
+}
+
+
+def _json_body_spec(schema: dict[str, Any]) -> dict[str, Any]:
+    request_body = {
+        "required": True,
+        "content": {"application/json": {"schema": schema}},
+    }
+    return _spec("/run", "post", {"requestBody": request_body})
+
+
+async def _call_tool_strict(
+    spec: dict[str, Any],
+    arguments: dict[str, Any],
+    requests: list[httpx2.Request] | None = None,
+) -> list[httpx2.Request]:
+    """Call a strict server's ``operation`` tool; return dispatched requests.
+
+    Pass a pre-created ``requests`` list to observe dispatches even when the
+    call is expected to raise.
+    """
+    dispatched: list[httpx2.Request] = [] if requests is None else requests
+    async with _upstream_client(dispatched) as http_client:
+        server = FastMCP.from_openapi(
+            openapi_spec=spec, client=http_client, strict_input_validation=True
+        )
+        async with Client(server) as client:
+            await client.call_tool("operation", arguments)
+    return dispatched
+
+
+async def test_strict_validation_rejects_invalid_nested_values() -> None:
+    # The reported scenario: options.level must be an integer and options
+    # forbids extra keys, yet the invalid dict reached the transport.
+    spec = _json_body_spec(NESTED_OBJECT_SCHEMA)
+    dispatched: list[httpx2.Request] = []
+    with pytest.raises(ToolError) as exc_info:
+        await _call_tool_strict(
+            spec, {"options": {"level": "one", "extra": 1}}, dispatched
+        )
+
+    assert dispatched == []
+    message = str(exc_info.value)
+    assert "does not match its schema" in message
+    assert "'one' is not of type 'integer'" in message
+    assert "Additional properties are not allowed" in message
+
+
+async def test_strict_validation_rejects_missing_nested_required_property() -> None:
+    spec = _json_body_spec(NESTED_OBJECT_SCHEMA)
+    dispatched: list[httpx2.Request] = []
+    with pytest.raises(ToolError) as exc_info:
+        await _call_tool_strict(spec, {"options": {}}, dispatched)
+
+    assert dispatched == []
+    assert "'level' is a required property" in str(exc_info.value)
+
+
+async def test_strict_validation_rejects_invalid_values_behind_refs() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"options": {"$ref": "#/components/schemas/Options"}},
+        "required": ["options"],
+    }
+    spec = _json_body_spec(schema)
+    spec["components"] = {
+        "schemas": {
+            "Options": {
+                "type": "object",
+                "properties": {"level": {"type": "integer"}},
+                "required": ["level"],
+                "additionalProperties": False,
+            }
+        }
+    }
+    dispatched: list[httpx2.Request] = []
+    with pytest.raises(ToolError) as exc_info:
+        await _call_tool_strict(spec, {"options": {"level": "one"}}, dispatched)
+
+    assert dispatched == []
+    assert "'one' is not of type 'integer'" in str(exc_info.value)
+
+
+async def test_strict_validation_rejects_invalid_array_item_values() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+    spec = _json_body_spec(schema)
+    dispatched: list[httpx2.Request] = []
+    with pytest.raises(ToolError) as exc_info:
+        await _call_tool_strict(
+            spec, {"rows": [{"count": 1}, {"count": "two"}]}, dispatched
+        )
+
+    assert dispatched == []
+    assert "'two' is not of type 'integer'" in str(exc_info.value)
+
+
+async def test_strict_validation_accepts_valid_nested_values() -> None:
+    closed = await _call_tool_strict(
+        _json_body_spec(NESTED_OBJECT_SCHEMA), {"options": {"level": 2}}
+    )
+    assert [json.loads(request.content) for request in closed] == [
+        {"options": {"level": 2}}
+    ]
+
+    open_schema = {
+        "type": "object",
+        "properties": {
+            "options": {"type": "object", "properties": {"level": {"type": "integer"}}}
+        },
+    }
+    opened = await _call_tool_strict(
+        _json_body_spec(open_schema), {"options": {"level": 2, "extra": 1}}
+    )
+    assert [json.loads(request.content) for request in opened] == [
+        {"options": {"level": 2, "extra": 1}}
+    ]
+
+
+async def test_nested_schema_violations_dispatch_without_strict_validation() -> None:
+    spec = _json_body_spec(NESTED_OBJECT_SCHEMA)
+    [request] = await _call_tool(spec, {"options": {"level": "one", "extra": 1}})
+    assert json.loads(request.content) == {"options": {"level": "one", "extra": 1}}

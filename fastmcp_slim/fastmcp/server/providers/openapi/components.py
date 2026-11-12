@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import httpx2
+from jsonschema import Draft202012Validator
 from mcp_types import ToolAnnotations
 from pydantic.networks import AnyUrl
 
@@ -244,6 +245,7 @@ class OpenAPITool(Tool):
                     f"Accepted: {', '.join(sorted(accepted)) or 'none'}",
                     log_level=logging.WARNING,
                 )
+            self._validate_argument_schemas(arguments, parameter_map)
         # Build the request — errors here are programming/schema issues,
         # not HTTP failures, so we catch them separately.
         try:
@@ -312,6 +314,46 @@ class OpenAPITool(Tool):
             )
         except json.JSONDecodeError:
             return ToolResult(content=response.text)
+
+    def _validate_argument_schemas(
+        self, arguments: dict[str, Any], parameter_map: dict[str, dict[str, str]]
+    ) -> None:
+        """Reject values that violate their advertised schema before dispatch.
+
+        The unknown-argument check enforces only the top-level key set, so a
+        value violating its property schema (wrong nested types, missing
+        nested ``required`` properties, keys beyond ``additionalProperties:
+        false``, or the same constraints behind ``$defs`` references) would
+        otherwise reach the HTTP transport verbatim. Each provided argument is
+        validated against the property schema the tool advertises; the root
+        parameters schema supplies the resolution scope so ``#/$defs/...``
+        references resolve, mirroring the director's null check.
+        """
+        properties = self.parameters.get("properties", {})
+        validator = Draft202012Validator(self.parameters)
+        for arg_name, value in arguments.items():
+            if value is None:
+                # The director applies its own null handling to body arguments.
+                continue
+            property_schema = properties.get(arg_name)
+            if property_schema is None:
+                mapping = parameter_map.get(arg_name)
+                if mapping is not None:
+                    property_schema = properties.get(mapping["openapi_name"])
+            if property_schema is None:
+                continue
+            errors = sorted(
+                validator.evolve(schema=property_schema).iter_errors(value),
+                key=lambda error: error.json_path,
+            )
+            if errors:
+                detail = "; ".join(
+                    f"{error.json_path}: {error.message}" for error in errors
+                )
+                raise ValidationError(
+                    f"Argument '{arg_name}' does not match its schema: {detail}",
+                    log_level=logging.WARNING,
+                )
 
 
 class OpenAPIResource(Resource):
