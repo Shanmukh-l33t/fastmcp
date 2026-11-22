@@ -1500,6 +1500,7 @@ def _make_dev_app(
         client = httpx2.AsyncClient(
             timeout=httpx2.Timeout(60.0, read=None), trust_env=False
         )
+        streaming = False
 
         async def _stream_and_cleanup(resp: httpx2.Response) -> Any:
             is_sse = "text/event-stream" in resp.headers.get("content-type", "")
@@ -1550,6 +1551,7 @@ def _make_dev_app(
                 params=dict(request.query_params),
             )
             resp = await client.send(req, stream=True)
+            streaming = True
             content_type = resp.headers.get("content-type", "")
             # Strip hop-by-hop headers that shouldn't be forwarded
             fwd_headers = {
@@ -1570,12 +1572,14 @@ def _make_dev_app(
                 media_type=content_type or "application/octet-stream",
             )
         except (httpx2.ConnectError, httpx2.ConnectTimeout):
-            await client.aclose()
             return Response(
                 content=json.dumps({"error": "MCP server not reachable"}).encode(),
                 status_code=503,
                 media_type="application/json",
             )
+        finally:
+            if not streaming:
+                await client.aclose()
 
     async def api_logs(request: Request) -> Response:
         """Return message log entries since a given id."""
