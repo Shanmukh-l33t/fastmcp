@@ -171,6 +171,16 @@ class TestSnapshotSerialization:
             == sensitive_snapshot
         )
 
+    def test_repr_does_not_disclose_credentials(
+        self, sensitive_snapshot: TaskContextSnapshot
+    ):
+        """The repr lands in logs and pytest output, so it must not carry secrets."""
+        for text in (repr(sensitive_snapshot), str(sensitive_snapshot)):
+            assert "token-client-a-user-1" not in text
+            assert "Bearer" not in text
+            assert "authorization" not in text.lower()
+            assert "session-1" in text  # non-secret fields stay visible
+
 
 async def _read_stored_snapshot(mcp: FastMCP, task_scope: str, task_id: str) -> str:
     """Return the raw stored value of a task's snapshot key."""
